@@ -34,8 +34,8 @@ RISK_PERCENT      = float(os.environ.get("RISK_PERCENT",     1))     # % Risiko 
 
 SYMBOL            = "BTCUSDT"
 RSI_PERIOD        = 14
-RSI_OVERSOLD      = 35
-RSI_OVERBOUGHT    = 65
+RSI_OVERSOLD      = 40
+RSI_OVERBOUGHT    = 60
 EMA_FAST          = 20
 EMA_SLOW          = 50
 KLINE_INTERVAL    = "5m"     # 5-Minuten-Kerzen wie in der Anleitung

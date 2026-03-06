@@ -1,8 +1,5 @@
 requests
-pandas
-schedule
+pyTelegramBotAPI
 gspread
-google-auth
-openpyxl
-anthropic
-python-dotenv
+oauth2client
+schedule

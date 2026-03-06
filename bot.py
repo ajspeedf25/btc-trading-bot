@@ -1,37 +1,40 @@
 """
 BTC Signal Bot
-- Google Credentials aus Railway-Umgebungsvariable (kein credentials.json nötig)
 - Preisdaten: Binance Public API (kostenlos, kein Account nötig)
 - RSI-Signale via Telegram
 - Wöchentlicher Performance-Report (jeden Sonntag 09:00)
 - Logging via Google Sheets
+- Google Credentials aus Railway-Umgebungsvariable (kein credentials.json nötig)
 """
 
+import os
+import json
 import time
 import logging
 import datetime
 import threading
+import tempfile
 import requests
-import schedule                          # ← war vorher fehlend!
+import schedule
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import telebot
 
 # ─────────────────────────────────────────────
-# KONFIGURATION
+# KONFIGURATION – aus Railway-Variablen
 # ─────────────────────────────────────────────
 
-TELEGRAM_TOKEN   = "8623042691:AAGHfryZ13YeqvMOfbCy-mxMtJ6SEK2ZLt4"
-TELEGRAM_CHAT_ID = "8623042691"
-SHEET_NAME       = "BTC Trade Log"
-GOOGLE_CREDS     = "credentials.json"
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "8623042691:AAGHfryZ13YeqvMOfbCy-mxMtJ6SEK2ZLt4")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "DEINE_ECHTE_CHAT_ID_HIER")
+SHEET_NAME       = os.environ.get("GOOGLE_SHEET_NAME","BTC Trade Log")
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS", "")  # kompletter JSON-String
 
-SYMBOL           = "BTCUSDT"
-RSI_PERIOD       = 14
-RSI_OVERSOLD     = 30        # Kaufsignal unter diesem Wert
-RSI_OVERBOUGHT   = 70        # Verkaufsignal über diesem Wert
-KLINE_INTERVAL   = "1h"      # 1m | 5m | 15m | 1h | 4h | 1d
-CHECK_INTERVAL   = 60        # Sekunden zwischen Prüfungen
+SYMBOL         = "BTCUSDT"
+RSI_PERIOD     = 14
+RSI_OVERSOLD   = 30
+RSI_OVERBOUGHT = 70
+KLINE_INTERVAL = "1h"
+CHECK_INTERVAL = 60
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
@@ -63,14 +66,29 @@ def send_telegram(message: str) -> None:
         logger.error(f"Telegram-Fehler: {e}")
 
 # ─────────────────────────────────────────────
-# GOOGLE SHEETS
+# GOOGLE SHEETS – Credentials aus Env-Variable
 # ─────────────────────────────────────────────
 
 def get_sheet():
+    """
+    Liest Google-Credentials aus der Umgebungsvariable GOOGLE_CREDENTIALS.
+    Schreibt sie temporär als Datei, damit oauth2client sie lesen kann.
+    """
+    if not GOOGLE_CREDS_JSON:
+        raise ValueError("GOOGLE_CREDENTIALS Umgebungsvariable fehlt in Railway!")
+
+    creds_dict = json.loads(GOOGLE_CREDS_JSON)
+
+    # Temporäre Datei anlegen (Railway hat kein persistentes Dateisystem)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+        json.dump(creds_dict, tmp)
+        tmp_path = tmp.name
+
     scope  = ["https://spreadsheets.google.com/feeds",
                "https://www.googleapis.com/auth/drive"]
-    creds  = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS, scope)
+    creds  = ServiceAccountCredentials.from_json_keyfile_name(tmp_path, scope)
     client = gspread.authorize(creds)
+    os.unlink(tmp_path)  # Temp-Datei wieder löschen
     return client.open(SHEET_NAME).sheet1
 
 def ensure_header() -> None:
@@ -92,10 +110,8 @@ def log_signal(signal: str, price: float, rsi: float, note: str = "") -> None:
         logger.error(f"Sheet-Fehler: {e}")
 
 def get_all_signals() -> list:
-    """Alle geloggten Signale aus dem Sheet lesen."""
     try:
-        sheet = get_sheet()
-        return sheet.get_all_records()
+        return get_sheet().get_all_records()
     except Exception as e:
         logger.error(f"Sheet-Lesefehler: {e}")
         return []
@@ -139,7 +155,6 @@ def calculate_rsi(closes: list, period: int = 14) -> float:
 # ─────────────────────────────────────────────
 
 def self_optimize() -> None:
-    """Wöchentlicher Performance-Report – jeden Sonntag 09:00."""
     logger.info("Wöchentlicher Report wird erstellt...")
     try:
         records = get_all_signals()
@@ -147,7 +162,6 @@ def self_optimize() -> None:
             send_telegram("📊 <b>Wöchentlicher Report</b>\nNoch keine Signale vorhanden.")
             return
 
-        # Letzte 7 Tage filtern
         since = datetime.datetime.now() - datetime.timedelta(days=7)
         week  = [r for r in records
                  if r.get("Signal") in ("BUY SIGNAL", "SELL SIGNAL")
@@ -156,14 +170,12 @@ def self_optimize() -> None:
         buy_count  = sum(1 for r in week if r["Signal"] == "BUY SIGNAL")
         sell_count = sum(1 for r in week if r["Signal"] == "SELL SIGNAL")
         total      = len(week)
-
         rsi_values = [float(r["RSI"]) for r in week if r.get("RSI")]
         avg_rsi    = round(sum(rsi_values) / len(rsi_values), 1) if rsi_values else 0
+        prices     = [float(r["Preis (USD)"]) for r in week if r.get("Preis (USD)")]
+        avg_price  = round(sum(prices) / len(prices), 2) if prices else 0
+        kw         = datetime.datetime.now().strftime("KW %W")
 
-        prices = [float(r["Preis (USD)"]) for r in week if r.get("Preis (USD)")]
-        avg_price = round(sum(prices) / len(prices), 2) if prices else 0
-
-        kw = datetime.datetime.now().strftime("KW %W")
         msg = (
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📈 <b>WÖCHENTLICHER REPORT</b>\n"
@@ -173,32 +185,26 @@ def self_optimize() -> None:
             f"🔴 Verkaufsignale: <b>{sell_count}</b>\n"
             f"📉 Ø RSI:          <b>{avg_rsi}</b>\n"
             f"💵 Ø BTC-Preis:    <b>${avg_price:,.2f}</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🤖 <b>KI-HINWEIS:</b>\n"
         )
-
-        # Einfache Empfehlungen
         if buy_count > sell_count * 2:
-            msg += "⚠️ Viele Kaufsignale – Markt könnte überverkauft sein, Geduld!\n"
+            msg += "⚠️ Viele Kaufsignale – Markt könnte überverkauft sein.\n"
         elif sell_count > buy_count * 2:
             msg += "⚠️ Viele Verkaufsignale – Abwärtsdruck, vorsichtig sein!\n"
         else:
             msg += "✅ Ausgeglichene Signal-Verteilung diese Woche.\n"
-
         if avg_rsi < 35:
-            msg += "📐 Durchschnittlicher RSI niedrig → historisch guter Einstiegsbereich.\n"
+            msg += "📐 RSI niedrig → historisch guter Einstiegsbereich.\n"
         elif avg_rsi > 65:
-            msg += "📐 Durchschnittlicher RSI hoch → Markt überhitzt, Risikomanagement beachten.\n"
+            msg += "📐 RSI hoch → Markt überhitzt, Risiko beachten.\n"
 
         send_telegram(msg)
-        logger.info("Wöchentlicher Report gesendet.")
-
     except Exception as e:
         logger.error(f"Report-Fehler: {e}")
         send_telegram(f"⚠️ Report-Fehler: {e}")
 
 # ─────────────────────────────────────────────
-# SCHEDULE THREAD (läuft parallel zur Hauptschleife)
+# SCHEDULE THREAD
 # ─────────────────────────────────────────────
 
 def run_schedule() -> None:
@@ -226,10 +232,7 @@ class BTCSignalBot:
             f"📊 Report: Sonntags 09:00 Uhr"
         )
         ensure_header()
-
-        # Schedule-Thread im Hintergrund starten
-        t = threading.Thread(target=run_schedule, daemon=True)
-        t.start()
+        threading.Thread(target=run_schedule, daemon=True).start()
 
     def run(self) -> None:
         while True:
@@ -249,36 +252,30 @@ class BTCSignalBot:
         closes = [float(k[4]) for k in klines]
         rsi    = calculate_rsi(closes, RSI_PERIOD)
         price  = get_current_price(SYMBOL)
-
         logger.info(f"BTC ${price:,.2f} | RSI {rsi} | Letztes Signal: {self.last_signal}")
 
-        # ── KAUFSIGNAL ──────────────────────────────────────────
         if rsi < RSI_OVERSOLD and self.last_signal != "BUY":
             self.last_signal = "BUY"
-            msg = (
+            send_telegram(
                 f"🟢 <b>KAUFSIGNAL – BTC überverkauft!</b>\n\n"
                 f"💵 Preis:  <b>${price:,.2f}</b>\n"
                 f"📉 RSI:    <b>{rsi}</b> (unter {RSI_OVERSOLD})\n"
                 f"⏰ Zeit:   {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
                 f"⚡ <i>Möglicher Einstiegspunkt!</i>"
             )
-            send_telegram(msg)
             log_signal("BUY SIGNAL", price, rsi, f"RSI unter {RSI_OVERSOLD}")
 
-        # ── VERKAUFSIGNAL ────────────────────────────────────────
         elif rsi > RSI_OVERBOUGHT and self.last_signal != "SELL":
             self.last_signal = "SELL"
-            msg = (
+            send_telegram(
                 f"🔴 <b>VERKAUFSIGNAL – BTC überkauft!</b>\n\n"
                 f"💵 Preis:  <b>${price:,.2f}</b>\n"
                 f"📈 RSI:    <b>{rsi}</b> (über {RSI_OVERBOUGHT})\n"
                 f"⏰ Zeit:   {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
                 f"⚡ <i>Möglicher Ausstiegspunkt!</i>"
             )
-            send_telegram(msg)
             log_signal("SELL SIGNAL", price, rsi, f"RSI über {RSI_OVERBOUGHT}")
 
-        # ── NEUTRALE ZONE – Signal-Reset ─────────────────────────
         elif RSI_OVERSOLD <= rsi <= RSI_OVERBOUGHT:
             if self.last_signal is not None:
                 logger.info("RSI neutral – Signal zurückgesetzt.")
@@ -289,5 +286,4 @@ class BTCSignalBot:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    signal_bot = BTCSignalBot()
-    signal_bot.run()
+    BTCSignalBot().run()

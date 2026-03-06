@@ -1,5 +1,6 @@
 """
 BTC Signal Bot
+- Google Credentials aus Railway-Umgebungsvariable (kein credentials.json nötig)
 - Preisdaten: Binance Public API (kostenlos, kein Account nötig)
 - RSI-Signale via Telegram
 - Wöchentlicher Performance-Report (jeden Sonntag 09:00)

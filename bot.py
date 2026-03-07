@@ -5,6 +5,7 @@ BTC Signal Bot
 - Detaillierte Telegram-Nachrichten mit Stop-Loss, Take-Profit, Positionsgröße
 - Wöchentlicher Performance-Report (Sonntags 09:00)
 - Google Sheets Logging
+- Mindestabstand zwischen Signalen: 30 Minuten (SIGNAL_COOLDOWN)
 """
 
 import os
@@ -40,6 +41,7 @@ EMA_FAST          = 20
 EMA_SLOW          = 50
 KLINE_INTERVAL    = "5m"     # 5-Minuten-Kerzen wie in der Anleitung
 CHECK_INTERVAL    = 60       # Sekunden
+SIGNAL_COOLDOWN   = 30       # Minuten Mindestabstand zwischen Signalen
 
 BINANCE_BASE_URL  = "https://api.binance.com"
 
@@ -334,8 +336,9 @@ def run_schedule() -> None:
 
 class BTCSignalBot:
     def __init__(self):
-        self.last_signal  = None
-        self.prev_ema_cross = None  # vorheriger EMA-Kreuzungsstatus
+        self.last_signal      = None
+        self.prev_ema_cross   = None                # vorheriger EMA-Kreuzungsstatus
+        self.last_signal_time = None                # Zeitstempel des letzten Signals
         logger.info("BTC Signal Bot gestartet.")
         send_telegram(
             f"🤖 <b>BTC Signal Bot gestartet</b>\n\n"
@@ -346,10 +349,22 @@ class BTCSignalBot:
             f"EMA:          {EMA_FAST}/{EMA_SLOW}\n"
             f"Kontostand:   <b>{ACCOUNT_BALANCE} €</b>\n"
             f"Risiko/Trade: <b>{RISK_PERCENT}%</b>\n"
+            f"⏳ Cooldown:   <b>{SIGNAL_COOLDOWN} Min.</b> zwischen Signalen\n"
             f"📊 Report:    Sonntags 09:00 Uhr"
         )
         ensure_header()
         threading.Thread(target=run_schedule, daemon=True).start()
+
+    # ── Cooldown-Prüfung ──────────────────────────────────────────────────────
+    def _cooldown_ok(self) -> bool:
+        """Gibt True zurück, wenn seit dem letzten Signal mind. SIGNAL_COOLDOWN Minuten vergangen sind."""
+        if self.last_signal_time is None:
+            return True
+        elapsed = (datetime.datetime.now() - self.last_signal_time).total_seconds() / 60
+        if elapsed < SIGNAL_COOLDOWN:
+            logger.info(f"Cooldown aktiv – noch {SIGNAL_COOLDOWN - elapsed:.1f} Min. warten.")
+            return False
+        return True
 
     def run(self) -> None:
         while True:
@@ -364,10 +379,10 @@ class BTCSignalBot:
             time.sleep(CHECK_INTERVAL)
 
     def _tick(self) -> None:
-        klines  = get_klines(SYMBOL, KLINE_INTERVAL, limit=100)
-        closes  = [float(k[4]) for k in klines]
-        price   = get_current_price(SYMBOL)
-        rsi     = calculate_rsi(closes, RSI_PERIOD)
+        klines   = get_klines(SYMBOL, KLINE_INTERVAL, limit=100)
+        closes   = [float(k[4]) for k in klines]
+        price    = get_current_price(SYMBOL)
+        rsi      = calculate_rsi(closes, RSI_PERIOD)
         ema_fast = calculate_ema(closes, EMA_FAST)
         ema_slow = calculate_ema(closes, EMA_SLOW)
         minutes  = get_minutes_to_next_candle(KLINE_INTERVAL)
@@ -385,29 +400,35 @@ class BTCSignalBot:
 
         # ── LONG SIGNAL ──────────────────────────────────────────
         if rsi < RSI_OVERSOLD and ema_bullish and self.last_signal != "LONG":
-            self.last_signal = "LONG"
-            msg = build_long_message(price, rsi, ema_fast, ema_slow, calc, minutes)
-            send_telegram(msg)
-            log_signal("LONG", price, rsi, ema_fast, ema_slow,
-                       calc["stop_loss"], calc["take_profit"],
-                       calc["pos_size"], calc["hebel"],
-                       f"RSI<{RSI_OVERSOLD}, EMA bullish")
+            if self._cooldown_ok():
+                self.last_signal      = "LONG"
+                self.last_signal_time = datetime.datetime.now()
+                msg = build_long_message(price, rsi, ema_fast, ema_slow, calc, minutes)
+                send_telegram(msg)
+                log_signal("LONG", price, rsi, ema_fast, ema_slow,
+                           calc["stop_loss"], calc["take_profit"],
+                           calc["pos_size"], calc["hebel"],
+                           f"RSI<{RSI_OVERSOLD}, EMA bullish")
 
         # ── SHORT SIGNAL ─────────────────────────────────────────
         elif rsi > RSI_OVERBOUGHT and ema_bearish and self.last_signal != "SHORT":
-            self.last_signal = "SHORT"
-            msg = build_short_message(price, rsi, ema_fast, ema_slow, calc, minutes)
-            send_telegram(msg)
-            log_signal("SHORT", price, rsi, ema_fast, ema_slow,
-                       calc["take_profit"], calc["stop_loss"],
-                       calc["pos_size"], calc["hebel"],
-                       f"RSI>{RSI_OVERBOUGHT}, EMA bearish")
+            if self._cooldown_ok():
+                self.last_signal      = "SHORT"
+                self.last_signal_time = datetime.datetime.now()
+                msg = build_short_message(price, rsi, ema_fast, ema_slow, calc, minutes)
+                send_telegram(msg)
+                log_signal("SHORT", price, rsi, ema_fast, ema_slow,
+                           calc["take_profit"], calc["stop_loss"],
+                           calc["pos_size"], calc["hebel"],
+                           f"RSI>{RSI_OVERBOUGHT}, EMA bearish")
 
         # ── RESET ────────────────────────────────────────────────
         elif RSI_OVERSOLD <= rsi <= RSI_OVERBOUGHT:
             if self.last_signal is not None:
                 logger.info("RSI neutral – Signal zurückgesetzt.")
             self.last_signal = None
+            # Hinweis: last_signal_time bleibt erhalten, damit der Cooldown
+            # auch nach einem Reset noch greift.
 
 # ─────────────────────────────────────────────
 # START

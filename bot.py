@@ -49,6 +49,13 @@ SIGNAL_COOLDOWN   = 30       # Minuten Mindestabstand zwischen Signalen
 
 BINANCE_BASE_URL  = "https://api.binance.com"
 
+# Manuell gesetzte Support/Widerstand-Levels (per /level Telegram-Command)
+manual_levels: dict = {"support": [], "resistance": []}
+
+# Manuell gesetzte Support/Widerstand-Levels (überschreiben Auto-Erkennung)
+# Format: {"support": [68540.0, 68200.0], "resistance": [69573.0, 70000.0]}
+manual_levels: dict = {"support": [], "resistance": []}
+
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
@@ -211,6 +218,115 @@ def calculate_rsi(closes: list, period: int = 14) -> float:
     return round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
 
 # ─────────────────────────────────────────────
+# SUPPORT / WIDERSTAND ERKENNUNG
+# ─────────────────────────────────────────────
+
+def find_levels(klines: list, price: float,
+                swing_window: int = 5,
+                max_levels: int = 3,
+                zone_pct: float = 0.003) -> dict:
+    """
+    Erkennt Support- und Widerstandslevel aus Swing-Highs und Swing-Lows.
+    Kombiniert Auto-Erkennung mit manuell gesetzten Levels.
+
+    swing_window : Anzahl Kerzen links/rechts für Swing-Erkennung
+    max_levels   : Wie viele Levels pro Seite zurückgegeben werden
+    zone_pct     : Levels innerhalb dieser % werden zusammengefasst (Cluster)
+    """
+    highs  = [float(k[2]) for k in klines]
+    lows   = [float(k[3]) for k in klines]
+    n      = len(klines)
+    w      = swing_window
+
+    swing_highs, swing_lows = [], []
+
+    for i in range(w, n - w):
+        if highs[i] == max(highs[i - w: i + w + 1]):
+            swing_highs.append(highs[i])
+        if lows[i] == min(lows[i - w: i + w + 1]):
+            swing_lows.append(lows[i])
+
+    def cluster(levels: list) -> list:
+        """Fasst nahe beieinanderliegende Levels zusammen (Durchschnitt)."""
+        levels = sorted(set(levels))
+        clustered = []
+        used = set()
+        for i, lv in enumerate(levels):
+            if i in used:
+                continue
+            group = [lv]
+            for j in range(i + 1, len(levels)):
+                if abs(levels[j] - lv) / lv <= zone_pct:
+                    group.append(levels[j])
+                    used.add(j)
+            clustered.append(round(sum(group) / len(group), 2))
+        return clustered
+
+    # Auto-erkannte Levels clustern
+    auto_sup = cluster(swing_lows)
+    auto_res = cluster(swing_highs)
+
+    # Manuelle Levels einmischen (globales Dict)
+    all_sup = cluster(auto_sup + manual_levels.get("support", []))
+    all_res = cluster(auto_res + manual_levels.get("resistance", []))
+
+    # Nur relevante Levels: Support UNTER Preis, Widerstand ÜBER Preis
+    supports    = sorted([l for l in all_sup if l < price], reverse=True)[:max_levels]
+    resistances = sorted([l for l in all_res if l > price])[:max_levels]
+
+    return {"support": supports, "resistance": resistances}
+
+
+def check_sl_near_level(sl_price: float, levels: dict,
+                         warn_pct: float = 0.005) -> str | None:
+    """
+    Gibt eine Warnung zurück, wenn der rechnerische Stop-Loss
+    einen Support-Level ignoriert (Level liegt zwischen SL und Einstieg).
+    warn_pct: Toleranzzone um den Level (±0.5%)
+    """
+    for sup in levels.get("support", []):
+        # Support liegt ÜBER dem SL → SL schneidet durch Support-Zone
+        if sl_price < sup and abs(sup - sl_price) / sl_price <= warn_pct * 3:
+            return (
+                f"⚠️ <b>SL-Warnung:</b> Rechnerischer Stop-Loss ${sl_price:,.2f} "
+                f"liegt nahe an Support ${sup:,.2f} – "
+                f"erwäge SL knapp unter ${sup:,.2f} zu setzen."
+            )
+        if sl_price < sup < (sl_price * (1 + warn_pct * 5)):
+            return (
+                f"⚠️ <b>SL-Warnung:</b> Support-Level ${sup:,.2f} wird vom "
+                f"rechnerischen SL ${sl_price:,.2f} ignoriert – "
+                f"logischer Stop wäre knapp unter ${round(sup * 0.999, 2):,.2f}."
+            )
+    return None
+
+
+def format_levels_block(levels: dict, direction: str) -> str:
+    """Erzeugt den Levels-Abschnitt für die Signal-Nachricht."""
+    sup_lines = "".join(
+        f"  🟦 Support:    ${l:,.2f}\n" for l in levels.get("support", [])
+    ) or "  – keine erkannt\n"
+    res_lines = "".join(
+        f"  🟥 Widerstand: ${l:,.2f}\n" for l in levels.get("resistance", [])
+    ) or "  – keine erkannt\n"
+
+    # Relevantesten Level für TP-Hinweis hervorheben
+    tp_hint = ""
+    if direction == "LONG" and levels.get("resistance"):
+        nearest_res = levels["resistance"][0]
+        tp_hint = f"\n  💡 Nächster Widerstand bei ${nearest_res:,.2f} – TP prüfen!"
+    elif direction == "SHORT" and levels.get("support"):
+        nearest_sup = levels["support"][0]
+        tp_hint = f"\n  💡 Nächster Support bei ${nearest_sup:,.2f} – TP prüfen!"
+
+    return (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📐 <b>STRUKTUR-LEVELS (Auto + Manuell):</b>\n"
+        f"{res_lines}{sup_lines}{tp_hint}\n"
+    )
+
+
+# ─────────────────────────────────────────────
 # POSITIONSGRÖSSE BERECHNEN
 # ─────────────────────────────────────────────
 
@@ -263,8 +379,11 @@ def calculate_position(price: float, stop_distance_pct: float) -> dict:
 # ─────────────────────────────────────────────
 
 def build_long_message(price: float, rsi: float, ema_fast: float,
-                        ema_slow: float, calc: dict, minutes_to_candle: int) -> str:
-    now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+                        ema_slow: float, calc: dict, minutes_to_candle: int,
+                        levels: dict | None = None, sl_warning: str | None = None) -> str:
+    now         = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+    levels_block = format_levels_block(levels, "LONG") if levels else ""
+    warning_line = f"\n{sl_warning}\n" if sl_warning else ""
     return (
         f"🚨 <b>BTC LONG-SIGNAL</b>\n\n"
         f"📌 Setup: EMA{EMA_FAST} kreuzt EMA{EMA_SLOW} von unten | "
@@ -274,8 +393,9 @@ def build_long_message(price: float, rsi: float, ema_fast: float,
         f"🔴 Stop-Loss:       <b>${calc['stop_loss']:,.2f}</b> "
         f"(–{calc['stop_pct']}%)\n"
         f"🟢 Take-Profit:     <b>${calc['take_profit']:,.2f}</b> "
-        f"(+{calc['tp_pct']}%) | RR 1:2\n\n"
-        f"📦 Margin (10%):         <b>{calc['margin']} €</b>\n"
+        f"(+{calc['tp_pct']}%) | RR 1:2\n"
+        f"{warning_line}"
+        f"\n📦 Margin (10%):         <b>{calc['margin']} €</b>\n"
         f"⚡ Hebel:                <b>{calc['hebel']}x</b>\n"
         f"📊 Positionsgröße:       <b>{calc['pos_size']} €</b>\n"
         f"💸 Max. Verlust (1%):    <b>{calc['real_verlust']} €</b>\n"
@@ -285,14 +405,18 @@ def build_long_message(price: float, rsi: float, ema_fast: float,
         f"  RSI ({RSI_PERIOD}):  {rsi}\n"
         f"  EMA{EMA_FAST}:      ${ema_fast:,.2f}\n"
         f"  EMA{EMA_SLOW}:      ${ema_slow:,.2f}\n\n"
+        f"{levels_block}"
         f"🕯 Bestätigung der nächsten 3 Kerzen läuft – du erhältst separate Nachrichten.\n\n"
         f"⏰ Nächste 5-Min-Kerze in: <b>{minutes_to_candle} Min.</b>\n"
         f"🕐 {now}"
     )
 
 def build_short_message(price: float, rsi: float, ema_fast: float,
-                         ema_slow: float, calc: dict, minutes_to_candle: int) -> str:
-    now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+                         ema_slow: float, calc: dict, minutes_to_candle: int,
+                         levels: dict | None = None, sl_warning: str | None = None) -> str:
+    now          = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+    levels_block = format_levels_block(levels, "SHORT") if levels else ""
+    warning_line = f"\n{sl_warning}\n" if sl_warning else ""
     return (
         f"🚨 <b>BTC SHORT-SIGNAL</b>\n\n"
         f"📌 Setup: EMA{EMA_FAST} kreuzt EMA{EMA_SLOW} von oben | "
@@ -302,8 +426,9 @@ def build_short_message(price: float, rsi: float, ema_fast: float,
         f"🔴 Stop-Loss:       <b>${calc['take_profit']:,.2f}</b> "
         f"(+{calc['stop_pct']}%)\n"
         f"🟢 Take-Profit:     <b>${calc['stop_loss']:,.2f}</b> "
-        f"(–{calc['tp_pct']}%) | RR 1:2\n\n"
-        f"📦 Margin (10%):         <b>{calc['margin']} €</b>\n"
+        f"(–{calc['tp_pct']}%) | RR 1:2\n"
+        f"{warning_line}"
+        f"\n📦 Margin (10%):         <b>{calc['margin']} €</b>\n"
         f"⚡ Hebel:                <b>{calc['hebel']}x</b>\n"
         f"📊 Positionsgröße:       <b>{calc['pos_size']} €</b>\n"
         f"💸 Max. Verlust (1%):    <b>{calc['real_verlust']} €</b>\n"
@@ -313,6 +438,7 @@ def build_short_message(price: float, rsi: float, ema_fast: float,
         f"  RSI ({RSI_PERIOD}):  {rsi}\n"
         f"  EMA{EMA_FAST}:      ${ema_fast:,.2f}\n"
         f"  EMA{EMA_SLOW}:      ${ema_slow:,.2f}\n\n"
+        f"{levels_block}"
         f"🕯 Bestätigung der nächsten 3 Kerzen läuft – du erhältst separate Nachrichten.\n\n"
         f"⏰ Nächste 5-Min-Kerze in: <b>{minutes_to_candle} Min.</b>\n"
         f"🕐 {now}"
@@ -631,6 +757,73 @@ def get_photo_url(file_id: str) -> str:
     file_path = resp.json()["result"]["file_path"]
     return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
+@tbot.message_handler(commands=["level", "levels"])
+def handle_level_command(message) -> None:
+    """
+    Manuelles Setzen von Support/Widerstand-Levels.
+
+    Syntax:
+      /level support 68540 68200     → setzt Support-Levels
+      /level resistance 69573 70000  → setzt Widerstand-Levels
+      /level clear                   → löscht alle manuellen Levels
+      /level show                    → zeigt aktuelle Levels an
+    """
+    global manual_levels
+    parts = message.text.strip().split()
+
+    if len(parts) < 2:
+        tbot.reply_to(message,
+            "ℹ️ <b>Verwendung:</b>\n"
+            "/level support 68540 68200\n"
+            "/level resistance 69573 70000\n"
+            "/level clear\n"
+            "/level show",
+            parse_mode="HTML")
+        return
+
+    cmd = parts[1].lower()
+
+    if cmd == "clear":
+        manual_levels = {"support": [], "resistance": []}
+        tbot.reply_to(message, "✅ Alle manuellen Levels gelöscht.", parse_mode="HTML")
+        logger.info("Manuelle Levels gelöscht.")
+
+    elif cmd == "show":
+        sup = ", ".join(f"${l:,.2f}" for l in manual_levels["support"]) or "–"
+        res = ", ".join(f"${l:,.2f}" for l in manual_levels["resistance"]) or "–"
+        tbot.reply_to(message,
+            f"📐 <b>Manuelle Levels:</b>\n  🟦 Support:    {sup}\n  🟥 Widerstand: {res}",
+            parse_mode="HTML")
+
+    elif cmd in ("support", "sup", "s"):
+        try:
+            vals = [round(float(p), 2) for p in parts[2:]]
+            manual_levels["support"] = vals
+            formatted = ", ".join(f"${v:,.2f}" for v in vals)
+            tbot.reply_to(message,
+                f"✅ Support-Levels gesetzt: <b>{formatted}</b>",
+                parse_mode="HTML")
+            logger.info(f"Manuelle Support-Levels: {vals}")
+        except ValueError:
+            tbot.reply_to(message, "❌ Ungültige Werte – nur Zahlen erlaubt.")
+
+    elif cmd in ("resistance", "res", "r", "widerstand", "w"):
+        try:
+            vals = [round(float(p), 2) for p in parts[2:]]
+            manual_levels["resistance"] = vals
+            formatted = ", ".join(f"${v:,.2f}" for v in vals)
+            tbot.reply_to(message,
+                f"✅ Widerstand-Levels gesetzt: <b>{formatted}</b>",
+                parse_mode="HTML")
+            logger.info(f"Manuelle Widerstand-Levels: {vals}")
+        except ValueError:
+            tbot.reply_to(message, "❌ Ungültige Werte – nur Zahlen erlaubt.")
+
+    else:
+        tbot.reply_to(message,
+            "❌ Unbekannter Befehl. Nutze: support, resistance, clear, show")
+
+
 @tbot.message_handler(content_types=["photo"])
 def handle_photo(message) -> None:
     """
@@ -730,8 +923,13 @@ class BTCSignalBot:
         ema_bullish = ema_fast > ema_slow   # EMA20 über EMA50
         ema_bearish = ema_fast < ema_slow
 
-        logger.info(f"BTC ${price:,.2f} | RSI {rsi} | "
-                    f"EMA{EMA_FAST} ${ema_fast:,.2f} | EMA{EMA_SLOW} ${ema_slow:,.2f}")
+        # Support/Widerstand erkennen
+        levels = find_levels(klines, price)
+        logger.info(
+            f"BTC ${price:,.2f} | RSI {rsi} | "
+            f"EMA{EMA_FAST} ${ema_fast:,.2f} | EMA{EMA_SLOW} ${ema_slow:,.2f} | "
+            f"Support: {levels['support']} | Widerstand: {levels['resistance']}"
+        )
 
         # Stop-Distanz dynamisch: 0.5% Standard
         stop_distance = 0.005
@@ -742,12 +940,15 @@ class BTCSignalBot:
             if self._cooldown_ok():
                 self.last_signal      = "LONG"
                 self.last_signal_time = datetime.datetime.now()
-                msg = build_long_message(price, rsi, ema_fast, ema_slow, calc, minutes)
+                sl_warning = check_sl_near_level(calc["stop_loss"], levels)
+                msg = build_long_message(price, rsi, ema_fast, ema_slow,
+                                         calc, minutes, levels, sl_warning)
                 send_telegram(msg)
                 log_signal("LONG", price, rsi, ema_fast, ema_slow,
                            calc["stop_loss"], calc["take_profit"],
-                           calc["pos_size"], 1.0,
-                           f"RSI<{RSI_OVERSOLD}, EMA bullish")
+                           calc["pos_size"], calc["hebel"],
+                           f"RSI<{RSI_OVERSOLD}, EMA bullish | "
+                           f"Sup:{levels['support']} Res:{levels['resistance']}")
                 threading.Thread(
                     target=run_candle_confirmation,
                     args=("LONG", price),
@@ -759,12 +960,15 @@ class BTCSignalBot:
             if self._cooldown_ok():
                 self.last_signal      = "SHORT"
                 self.last_signal_time = datetime.datetime.now()
-                msg = build_short_message(price, rsi, ema_fast, ema_slow, calc, minutes)
+                sl_warning = check_sl_near_level(calc["take_profit"], levels)
+                msg = build_short_message(price, rsi, ema_fast, ema_slow,
+                                          calc, minutes, levels, sl_warning)
                 send_telegram(msg)
                 log_signal("SHORT", price, rsi, ema_fast, ema_slow,
                            calc["take_profit"], calc["stop_loss"],
-                           calc["pos_size"], 1.0,
-                           f"RSI>{RSI_OVERBOUGHT}, EMA bearish")
+                           calc["pos_size"], calc["hebel"],
+                           f"RSI>{RSI_OVERBOUGHT}, EMA bearish | "
+                           f"Sup:{levels['support']} Res:{levels['resistance']}")
                 threading.Thread(
                     target=run_candle_confirmation,
                     args=("SHORT", price),

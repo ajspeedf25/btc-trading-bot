@@ -3,6 +3,8 @@ BTC Signal Bot
 - Preisdaten: Binance Public API (kostenlos)
 - RSI + EMA Signale
 - Detaillierte Telegram-Nachrichten mit Stop-Loss, Take-Profit, Positionsgröße
+- Positionsgröße: immer 10% des Kontostands pro Trade
+- Kerzen-Bestätigung: Nach Signal werden die nächsten 3 Kerzen einzeln bewertet
 - Wöchentlicher Performance-Report (Sonntags 09:00)
 - Google Sheets Logging
 - Mindestabstand zwischen Signalen: 30 Minuten (SIGNAL_COOLDOWN)
@@ -30,8 +32,10 @@ TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "8718482804")
 SHEET_NAME        = os.environ.get("GOOGLE_SHEET_NAME", "BTC Trade Log")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS", "")
 
-ACCOUNT_BALANCE   = float(os.environ.get("ACCOUNT_BALANCE", 500))   # € Kontostand
-RISK_PERCENT      = float(os.environ.get("RISK_PERCENT",     1))     # % Risiko pro Trade
+ACCOUNT_BALANCE   = float(os.environ.get("ACCOUNT_BALANCE", 500))   # € Gesamtkapital
+TRADE_ALLOCATION  = 0.10   # 10% des Kapitals als Margin einsetzen
+RISK_PERCENT      = 0.01   # 1% des Gesamtkapitals als max. Verlust pro Trade
+MAX_HEBEL         = 10.0   # Sicherheits-Obergrenze für den Hebel
 
 SYMBOL            = "BTCUSDT"
 RSI_PERIOD        = 14
@@ -90,14 +94,15 @@ def get_sheet():
     os.unlink(tmp_path)
     return client.open(SHEET_NAME).sheet1
 
+SHEET_HEADER = ["Timestamp", "Signal", "Symbol", "Preis (USD)", "RSI",
+                "EMA20", "EMA50", "Stop-Loss", "Take-Profit",
+                "Positionsgröße (€)", "Hebel", "Hinweis", "Screenshot"]
+
 def ensure_header() -> None:
     try:
-        sheet  = get_sheet()
-        header = ["Timestamp", "Signal", "Symbol", "Preis (USD)", "RSI",
-                  "EMA20", "EMA50", "Stop-Loss", "Take-Profit",
-                  "Positionsgröße (€)", "Hebel", "Hinweis"]
-        if sheet.row_values(1) != header:
-            sheet.insert_row(header, 1)
+        sheet = get_sheet()
+        if sheet.row_values(1) != SHEET_HEADER:
+            sheet.insert_row(SHEET_HEADER, 1)
     except Exception as e:
         logger.error(f"Header-Fehler: {e}")
 
@@ -119,6 +124,41 @@ def get_all_signals() -> list:
     except Exception as e:
         logger.error(f"Sheet-Lesefehler: {e}")
         return []
+
+def log_screenshot_to_sheet(photo_url: str) -> str:
+    """
+    Sucht die letzte Signal-Zeile (LONG/SHORT) ohne Screenshot-Eintrag
+    und trägt den Foto-Link in die Screenshot-Spalte ein.
+    """
+    try:
+        sheet   = get_sheet()
+        rows    = sheet.get_all_values()
+        header  = rows[0]
+        scr_col = header.index("Screenshot") + 1   # 1-basiert für gspread
+        sig_col = header.index("Signal")
+
+        # Letzte Zeile mit LONG/SHORT ohne Screenshot (von unten suchen)
+        target_row = None
+        for i in range(len(rows) - 1, 0, -1):
+            row     = rows[i]
+            sig_val = row[sig_col]     if len(row) > sig_col    else ""
+            scr_val = row[scr_col - 1] if len(row) >= scr_col   else ""
+            if sig_val in ("LONG", "SHORT") and not scr_val.strip():
+                target_row = i + 1    # Sheet-Zeilen sind 1-basiert
+                break
+
+        if target_row is None:
+            return "⚠️ Keine offene Signal-Zeile ohne Screenshot gefunden."
+
+        sheet.update_cell(target_row, scr_col, photo_url)
+        ts  = rows[target_row - 1][header.index("Timestamp")]
+        sig = rows[target_row - 1][sig_col]
+        logger.info(f"Screenshot in Zeile {target_row} eingetragen ({sig} @ {ts})")
+        return f"✅ Screenshot eingetragen\nSignal: <b>{sig}</b> | Zeitstempel: {ts}"
+
+    except Exception as e:
+        logger.error(f"Screenshot-Sheet-Fehler: {e}")
+        return f"❌ Fehler beim Eintragen: {e}"
 
 # ─────────────────────────────────────────────
 # BINANCE PUBLIC API
@@ -176,28 +216,44 @@ def calculate_rsi(closes: list, period: int = 14) -> float:
 
 def calculate_position(price: float, stop_distance_pct: float) -> dict:
     """
-    Berechnet Positionsgröße, Hebel, Stop-Loss und Take-Profit.
-    stop_distance_pct: z.B. 0.005 für 0.5%
+    Positionsgröße (Margin) = 10% des Kontostands.
+    Max. Verlust           = 1% des Gesamtkapitals.
+    Hebel                  = max_verlust / (margin * stop_distance_pct)
+                             → so groß wie nötig, max. MAX_HEBEL.
+
+    Beispiel bei 500 € Konto, 0.5% Stop:
+      margin     = 50 €
+      max_verlust= 5 €
+      hebel      = 5 / (50 * 0.005) = 20x → auf MAX_HEBEL gedeckelt
     """
-    risiko_eur  = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
-    pos_size    = round(risiko_eur / stop_distance_pct, 2)
-    hebel       = round(pos_size / ACCOUNT_BALANCE, 1)
-    # Hebel auf max 3x begrenzen (Empfehlung aus Anleitung)
-    hebel       = min(hebel, 3.0)
-    pos_size    = round(ACCOUNT_BALANCE * hebel, 2)
+    margin      = round(ACCOUNT_BALANCE * TRADE_ALLOCATION, 2)   # 10% Einsatz
+    max_verlust = round(ACCOUNT_BALANCE * RISK_PERCENT, 2)        # 1% Risiko
+
+    # Hebel so berechnen, dass bei SL-Treffer exakt max_verlust verloren geht
+    hebel_raw   = max_verlust / (margin * stop_distance_pct)
+    hebel       = round(min(hebel_raw, MAX_HEBEL), 1)
+
+    # Tatsächliche Positionsgröße (Margin × Hebel)
+    pos_size    = round(margin * hebel, 2)
+
+    # Tatsächlicher Verlust bei SL (kann < max_verlust sein wenn Hebel gedeckelt)
+    real_verlust = round(margin * stop_distance_pct * hebel, 2)
+
+    # Liquidationsdistanz ≈ 1/Hebel (ohne Funding/Fees)
+    liq_distance = round((1 / hebel) * 100, 1)
 
     stop_loss   = round(price * (1 - stop_distance_pct), 2)
     take_profit = round(price * (1 + stop_distance_pct * 2), 2)  # RR 1:2
 
-    liq_distance = round((1 / hebel) * 100, 1) if hebel > 0 else 100
-
     return {
-        "risiko_eur":    risiko_eur,
+        "margin":        margin,
         "pos_size":      pos_size,
+        "max_verlust":   max_verlust,
+        "real_verlust":  real_verlust,
         "hebel":         hebel,
+        "liq_distance":  liq_distance,
         "stop_loss":     stop_loss,
         "take_profit":   take_profit,
-        "liq_distance":  liq_distance,
         "stop_pct":      round(stop_distance_pct * 100, 2),
         "tp_pct":        round(stop_distance_pct * 2 * 100, 2),
     }
@@ -219,20 +275,17 @@ def build_long_message(price: float, rsi: float, ema_fast: float,
         f"(–{calc['stop_pct']}%)\n"
         f"🟢 Take-Profit:     <b>${calc['take_profit']:,.2f}</b> "
         f"(+{calc['tp_pct']}%) | RR 1:2\n\n"
-        f"⚡ Empf. Hebel:     <b>{calc['hebel']}x</b>\n"
-        f"📦 Positionsgröße:  <b>{calc['pos_size']} €</b>\n"
-        f"💸 Max. Risiko:     <b>{calc['risiko_eur']} €</b> "
-        f"({RISK_PERCENT}% vom Konto)\n"
-        f"⚠️ Liquidation ca.: <b>{calc['liq_distance']}%</b> entfernt\n\n"
+        f"📦 Margin (10%):         <b>{calc['margin']} €</b>\n"
+        f"⚡ Hebel:                <b>{calc['hebel']}x</b>\n"
+        f"📊 Positionsgröße:       <b>{calc['pos_size']} €</b>\n"
+        f"💸 Max. Verlust (1%):    <b>{calc['real_verlust']} €</b>\n"
+        f"⚠️ Liquidation ca.:      <b>{calc['liq_distance']}%</b> entfernt\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Indikatoren:\n"
         f"  RSI ({RSI_PERIOD}):  {rsi}\n"
         f"  EMA{EMA_FAST}:      ${ema_fast:,.2f}\n"
         f"  EMA{EMA_SLOW}:      ${ema_slow:,.2f}\n\n"
-        f"🕯 <b>BESTÄTIGUNG</b> – Nächste 3 × 5-Min-Kerzen:\n"
-        f"  Kerze 1: Schlusskurs über ${round(price * 1.001, 2):,}\n"
-        f"  Kerze 2: Kein Unterschreiten von ${round(price * 0.998, 2):,}\n"
-        f"  Kerze 3: Ausbruch mit Volumen-Bestätigung\n\n"
+        f"🕯 Bestätigung der nächsten 3 Kerzen läuft – du erhältst separate Nachrichten.\n\n"
         f"⏰ Nächste 5-Min-Kerze in: <b>{minutes_to_candle} Min.</b>\n"
         f"🕐 {now}"
     )
@@ -250,23 +303,264 @@ def build_short_message(price: float, rsi: float, ema_fast: float,
         f"(+{calc['stop_pct']}%)\n"
         f"🟢 Take-Profit:     <b>${calc['stop_loss']:,.2f}</b> "
         f"(–{calc['tp_pct']}%) | RR 1:2\n\n"
-        f"⚡ Empf. Hebel:     <b>{calc['hebel']}x</b> | "
-        f"Positionsgröße: <b>{calc['pos_size']} €</b>\n"
-        f"💸 Max. Risiko:     <b>{calc['risiko_eur']} €</b> "
-        f"({RISK_PERCENT}% vom Konto)\n"
-        f"⚠️ Liquidation ca.: <b>{calc['liq_distance']}%</b> entfernt\n\n"
+        f"📦 Margin (10%):         <b>{calc['margin']} €</b>\n"
+        f"⚡ Hebel:                <b>{calc['hebel']}x</b>\n"
+        f"📊 Positionsgröße:       <b>{calc['pos_size']} €</b>\n"
+        f"💸 Max. Verlust (1%):    <b>{calc['real_verlust']} €</b>\n"
+        f"⚠️ Liquidation ca.:      <b>{calc['liq_distance']}%</b> entfernt\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Indikatoren:\n"
         f"  RSI ({RSI_PERIOD}):  {rsi}\n"
         f"  EMA{EMA_FAST}:      ${ema_fast:,.2f}\n"
         f"  EMA{EMA_SLOW}:      ${ema_slow:,.2f}\n\n"
-        f"🕯 <b>BESTÄTIGUNG</b> – Nächste 3 × 5-Min-Kerzen:\n"
-        f"  Kerze 1: Schlusskurs unter ${round(price * 0.999, 2):,}\n"
-        f"  Kerze 2: Kein Überschreiten von ${round(price * 1.002, 2):,}\n"
-        f"  Kerze 3: Fortsetzung mit Volumen-Bestätigung\n\n"
+        f"🕯 Bestätigung der nächsten 3 Kerzen läuft – du erhältst separate Nachrichten.\n\n"
         f"⏰ Nächste 5-Min-Kerze in: <b>{minutes_to_candle} Min.</b>\n"
         f"🕐 {now}"
     )
+
+# ─────────────────────────────────────────────
+# KERZEN-BESTÄTIGUNG
+# ─────────────────────────────────────────────
+
+def _wait_for_next_closed_candle(after_time: datetime.datetime) -> dict | None:
+    """
+    Wartet, bis eine neue abgeschlossene 5-Min-Kerze verfügbar ist,
+    deren open_time NACH after_time liegt. Gibt die Kerze als dict zurück.
+    Timeout: 10 Minuten, danach None.
+    """
+    deadline = after_time + datetime.timedelta(minutes=10)
+    while datetime.datetime.now() < deadline:
+        try:
+            klines = get_klines(SYMBOL, KLINE_INTERVAL, limit=5)
+            # klines[-1] ist die noch laufende Kerze → [-2] ist die letzte abgeschlossene
+            last_closed = klines[-2]
+            open_time   = datetime.datetime.fromtimestamp(last_closed[0] / 1000)
+            if open_time > after_time:
+                return {
+                    "open_time":  open_time,
+                    "open":       float(last_closed[1]),
+                    "high":       float(last_closed[2]),
+                    "low":        float(last_closed[3]),
+                    "close":      float(last_closed[4]),
+                    "volume":     float(last_closed[5]),
+                }
+        except Exception as e:
+            logger.error(f"Kerzen-Abruf Fehler: {e}")
+        time.sleep(15)
+    return None
+
+
+def _check_candle_long(candle: dict, entry_price: float, candle_num: int,
+                        prev_candle: dict | None) -> tuple[bool, str]:
+    """
+    Prüft eine Kerze auf Long-Bestätigung.
+    Gibt (bestätigt: bool, nachricht: str) zurück.
+    """
+    c     = candle["close"]
+    o     = candle["open"]
+    h     = candle["high"]
+    l     = candle["low"]
+    vol   = candle["volume"]
+    body  = abs(c - o)
+    range_ = h - l if (h - l) > 0 else 0.0001
+
+    if candle_num == 1:
+        # Kerze 1: Schlusskurs muss über Einstiegspreis liegen, bullische Kerze
+        if c > entry_price and c > o:
+            return True, (
+                f"✅ Kerze 1 bestätigt\n"
+                f"Schlusskurs ${c:,.2f} liegt über Einstieg ${entry_price:,.2f} "
+                f"– bullische Kerze (Body: ${body:,.2f})"
+            )
+        elif c <= entry_price:
+            return False, (
+                f"❌ Kerze 1 nicht bestätigt – Trade abbrechen\n"
+                f"Schlusskurs ${c:,.2f} liegt UNTER Einstieg ${entry_price:,.2f} "
+                f"– kein Aufwärtsmomentum"
+            )
+        else:
+            return False, (
+                f"⚠️ Kerze 1 nicht bestätigt – Trade abbrechen\n"
+                f"Schlusskurs ${c:,.2f} über Einstieg, aber bärische Kerze "
+                f"(Close unter Open) – Schwäche im Aufwärtsdruck"
+            )
+
+    elif candle_num == 2:
+        # Kerze 2: Kein Unterschreiten des Einstiegs, Tief darf nicht zu tief fallen
+        support_level = round(entry_price * 0.998, 2)  # max. 0.2% unter Einstieg
+        if l >= support_level and c >= entry_price:
+            return True, (
+                f"✅ Kerze 2 bestätigt\n"
+                f"Tief ${l:,.2f} hält Support bei ${support_level:,.2f} "
+                f"– Aufwärtstrend intakt, Schlusskurs ${c:,.2f}"
+            )
+        elif l < support_level:
+            return False, (
+                f"❌ Kerze 2 nicht bestätigt – Trade abbrechen\n"
+                f"Tief ${l:,.2f} hat Support ${support_level:,.2f} gebrochen "
+                f"– Stop-Loss-Gefahr, Trend ungültig"
+            )
+        else:
+            return False, (
+                f"⚠️ Kerze 2 nicht bestätigt – Trade abbrechen\n"
+                f"Schlusskurs ${c:,.2f} unter Einstieg ${entry_price:,.2f} "
+                f"– Aufwärtsdruck lässt nach"
+            )
+
+    else:  # Kerze 3
+        # Kerze 3: Volumen-Bestätigung + klares Momentum
+        prev_vol     = prev_candle["volume"] if prev_candle else vol
+        vol_ok       = vol > prev_vol * 1.1          # mind. 10% mehr Volumen
+        momentum_ok  = c > o and (body / range_) > 0.5  # bullische Körper-Dominanz
+        new_high     = h > (prev_candle["high"] if prev_candle else h)
+
+        if vol_ok and momentum_ok and new_high:
+            return True, (
+                f"✅ Kerze 3 bestätigt – Einstieg empfohlen ✅\n"
+                f"Starkes Volumen (+{round((vol/prev_vol-1)*100)}% vs. Vorkerze), "
+                f"bullischer Schlusskurs ${c:,.2f}, "
+                f"neues Hoch bei ${h:,.2f} – Ausbruch bestätigt"
+            )
+        elif vol_ok and momentum_ok:
+            return True, (
+                f"✅ Kerze 3 bestätigt – Einstieg möglich ✅\n"
+                f"Volumen und Momentum stimmen (Schlusskurs ${c:,.2f}), "
+                f"jedoch kein neues Hoch – Einstieg mit erhöhter Vorsicht"
+            )
+        elif not vol_ok and momentum_ok:
+            return False, (
+                f"⚠️ Kerze 3 nicht bestätigt – Trade abbrechen\n"
+                f"Aufwärtskerze vorhanden (${c:,.2f}), aber Volumen zu schwach "
+                f"({round(vol):,} vs. {round(prev_vol):,} Vorkerze) – "
+                f"Ausbruch ohne Überzeugung, kein Einstieg"
+            )
+        else:
+            return False, (
+                f"❌ Kerze 3 nicht bestätigt – Trade abbrechen\n"
+                f"Kein Momentum: bärische Kerze (Close ${c:,.2f} unter Open ${o:,.2f}) "
+                f"und schwaches Volumen – Signal ungültig"
+            )
+
+
+def _check_candle_short(candle: dict, entry_price: float, candle_num: int,
+                         prev_candle: dict | None) -> tuple[bool, str]:
+    """
+    Prüft eine Kerze auf Short-Bestätigung.
+    Gibt (bestätigt: bool, nachricht: str) zurück.
+    """
+    c     = candle["close"]
+    o     = candle["open"]
+    h     = candle["high"]
+    l     = candle["low"]
+    vol   = candle["volume"]
+    body  = abs(c - o)
+    range_ = h - l if (h - l) > 0 else 0.0001
+
+    if candle_num == 1:
+        if c < entry_price and c < o:
+            return True, (
+                f"✅ Kerze 1 bestätigt\n"
+                f"Schlusskurs ${c:,.2f} liegt unter Einstieg ${entry_price:,.2f} "
+                f"– bärische Kerze (Body: ${body:,.2f})"
+            )
+        elif c >= entry_price:
+            return False, (
+                f"❌ Kerze 1 nicht bestätigt – Trade abbrechen\n"
+                f"Schlusskurs ${c:,.2f} liegt ÜBER Einstieg ${entry_price:,.2f} "
+                f"– kein Abwärtsmomentum"
+            )
+        else:
+            return False, (
+                f"⚠️ Kerze 1 nicht bestätigt – Trade abbrechen\n"
+                f"Schlusskurs unter Einstieg, aber bullische Kerze "
+                f"(Close über Open) – Gegendruck vorhanden"
+            )
+
+    elif candle_num == 2:
+        resistance = round(entry_price * 1.002, 2)  # max. 0.2% über Einstieg
+        if h <= resistance and c <= entry_price:
+            return True, (
+                f"✅ Kerze 2 bestätigt\n"
+                f"Hoch ${h:,.2f} hält Widerstand bei ${resistance:,.2f} "
+                f"– Abwärtstrend intakt, Schlusskurs ${c:,.2f}"
+            )
+        elif h > resistance:
+            return False, (
+                f"❌ Kerze 2 nicht bestätigt – Trade abbrechen\n"
+                f"Hoch ${h:,.2f} hat Widerstand ${resistance:,.2f} überschritten "
+                f"– Short-Setup ungültig, Stop-Loss-Gefahr"
+            )
+        else:
+            return False, (
+                f"⚠️ Kerze 2 nicht bestätigt – Trade abbrechen\n"
+                f"Schlusskurs ${c:,.2f} über Einstieg ${entry_price:,.2f} "
+                f"– Abwärtsdruck lässt nach"
+            )
+
+    else:  # Kerze 3
+        prev_vol    = prev_candle["volume"] if prev_candle else vol
+        vol_ok      = vol > prev_vol * 1.1
+        momentum_ok = c < o and (body / range_) > 0.5   # bärische Körper-Dominanz
+        new_low     = l < (prev_candle["low"] if prev_candle else l)
+
+        if vol_ok and momentum_ok and new_low:
+            return True, (
+                f"✅ Kerze 3 bestätigt – Einstieg empfohlen ✅\n"
+                f"Starkes Volumen (+{round((vol/prev_vol-1)*100)}% vs. Vorkerze), "
+                f"bärischer Schlusskurs ${c:,.2f}, "
+                f"neues Tief bei ${l:,.2f} – Ausbruch nach unten bestätigt"
+            )
+        elif vol_ok and momentum_ok:
+            return True, (
+                f"✅ Kerze 3 bestätigt – Einstieg möglich ✅\n"
+                f"Volumen und Momentum stimmen (Schlusskurs ${c:,.2f}), "
+                f"jedoch kein neues Tief – Einstieg mit erhöhter Vorsicht"
+            )
+        elif not vol_ok and momentum_ok:
+            return False, (
+                f"⚠️ Kerze 3 nicht bestätigt – Trade abbrechen\n"
+                f"Abwärtskerze vorhanden (${c:,.2f}), aber Volumen zu schwach "
+                f"({round(vol):,} vs. {round(prev_vol):,} Vorkerze) – "
+                f"Ausbruch ohne Überzeugung, kein Einstieg"
+            )
+        else:
+            return False, (
+                f"❌ Kerze 3 nicht bestätigt – Trade abbrechen\n"
+                f"Kein Momentum: bullische Kerze (Close ${c:,.2f} über Open ${o:,.2f}) "
+                f"und schwaches Volumen – Signal ungültig"
+            )
+
+
+def run_candle_confirmation(direction: str, entry_price: float) -> None:
+    """
+    Läuft in einem eigenen Thread. Wartet auf 3 abgeschlossene Kerzen nach dem Signal
+    und sendet für jede eine separate Telegram-Nachricht.
+    direction: "LONG" oder "SHORT"
+    """
+    logger.info(f"Kerzen-Bestätigung gestartet für {direction} @ ${entry_price:,.2f}")
+    check_fn   = _check_candle_long if direction == "LONG" else _check_candle_short
+    after_time = datetime.datetime.now()
+    prev_candle = None
+
+    for candle_num in range(1, 4):
+        candle = _wait_for_next_closed_candle(after_time)
+        if candle is None:
+            send_telegram(
+                f"⏰ Kerze {candle_num} Timeout – Bestätigung abgebrochen.\n"
+                f"Keine neue Kerze nach 10 Minuten erhalten."
+            )
+            return
+
+        ok, msg = check_fn(candle, entry_price, candle_num, prev_candle)
+        send_telegram(msg)
+        logger.info(f"Kerze {candle_num}: {'✅' if ok else '❌'} | {direction}")
+
+        if not ok:
+            return  # Abbruch bei nicht bestätigter Kerze
+
+        after_time  = candle["open_time"]
+        prev_candle = candle
+
 
 # ─────────────────────────────────────────────
 # WÖCHENTLICHER PERFORMANCE-REPORT
@@ -312,12 +606,53 @@ def self_optimize() -> None:
             msg += "📐 Ø RSI niedrig → Markt überverkauft, Long-Bias\n"
         elif avg_rsi > 65:
             msg += "📐 Ø RSI hoch → Markt überhitzt, vorsichtig bei Longs\n"
-        msg += f"\n💰 Kontostand: <b>{ACCOUNT_BALANCE} €</b> | Risiko: <b>{RISK_PERCENT}%</b>"
+        msg += (
+            f"\n💰 Kontostand: <b>{ACCOUNT_BALANCE} €</b> | "
+            f"Margin: <b>10% = {round(ACCOUNT_BALANCE * TRADE_ALLOCATION, 2)} €</b> | "
+            f"Max. Risiko: <b>1% = {round(ACCOUNT_BALANCE * RISK_PERCENT, 2)} €</b>"
+        )
 
         send_telegram(msg)
     except Exception as e:
         logger.error(f"Report-Fehler: {e}")
         send_telegram(f"⚠️ Report-Fehler: {e}")
+
+# ─────────────────────────────────────────────
+# TELEGRAM FOTO-HANDLER (Screenshot-Upload)
+# ─────────────────────────────────────────────
+
+def get_photo_url(file_id: str) -> str:
+    """Gibt die direkte Download-URL eines Telegram-Fotos zurück."""
+    resp = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+        params={"file_id": file_id}, timeout=10
+    )
+    resp.raise_for_status()
+    file_path = resp.json()["result"]["file_path"]
+    return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+
+@tbot.message_handler(content_types=["photo"])
+def handle_photo(message) -> None:
+    """
+    Wird ausgelöst, wenn du ein Foto an den Bot schickst.
+    Nimmt die höchste Auflösung, holt die Download-URL
+    und trägt sie in die letzte offene Sheet-Zeile ein.
+    """
+    try:
+        # Höchste Auflösung = letztes Element in photo-Array
+        file_id   = message.photo[-1].file_id
+        photo_url = get_photo_url(file_id)
+        caption   = message.caption or ""
+
+        status = log_screenshot_to_sheet(photo_url)
+        reply  = f"📸 <b>Screenshot empfangen</b>\n{status}"
+        if caption:
+            reply += f"\n📝 Caption: {caption}"
+        tbot.reply_to(message, reply, parse_mode="HTML")
+        logger.info(f"Foto verarbeitet: {photo_url}")
+    except Exception as e:
+        logger.error(f"Foto-Handler Fehler: {e}")
+        tbot.reply_to(message, f"❌ Fehler beim Verarbeiten: {e}")
 
 # ─────────────────────────────────────────────
 # SCHEDULE THREAD
@@ -348,12 +683,16 @@ class BTCSignalBot:
             f"RSI Short:    &gt; {RSI_OVERBOUGHT}\n"
             f"EMA:          {EMA_FAST}/{EMA_SLOW}\n"
             f"Kontostand:   <b>{ACCOUNT_BALANCE} €</b>\n"
-            f"Risiko/Trade: <b>{RISK_PERCENT}%</b>\n"
+            f"Margin/Trade: <b>10% = {round(ACCOUNT_BALANCE * TRADE_ALLOCATION, 2)} €</b>\n"
+            f"Max. Risiko:  <b>1% = {round(ACCOUNT_BALANCE * RISK_PERCENT, 2)} €</b>\n"
+            f"Max. Hebel:   <b>{MAX_HEBEL}x</b>\n"
             f"⏳ Cooldown:   <b>{SIGNAL_COOLDOWN} Min.</b> zwischen Signalen\n"
             f"📊 Report:    Sonntags 09:00 Uhr"
         )
         ensure_header()
         threading.Thread(target=run_schedule, daemon=True).start()
+        # Polling-Thread für eingehende Telegram-Nachrichten (z.B. Foto-Uploads)
+        threading.Thread(target=tbot.infinity_polling, daemon=True).start()
 
     # ── Cooldown-Prüfung ──────────────────────────────────────────────────────
     def _cooldown_ok(self) -> bool:
@@ -407,8 +746,13 @@ class BTCSignalBot:
                 send_telegram(msg)
                 log_signal("LONG", price, rsi, ema_fast, ema_slow,
                            calc["stop_loss"], calc["take_profit"],
-                           calc["pos_size"], calc["hebel"],
+                           calc["pos_size"], 1.0,
                            f"RSI<{RSI_OVERSOLD}, EMA bullish")
+                threading.Thread(
+                    target=run_candle_confirmation,
+                    args=("LONG", price),
+                    daemon=True
+                ).start()
 
         # ── SHORT SIGNAL ─────────────────────────────────────────
         elif rsi > RSI_OVERBOUGHT and ema_bearish and self.last_signal != "SHORT":
@@ -419,8 +763,13 @@ class BTCSignalBot:
                 send_telegram(msg)
                 log_signal("SHORT", price, rsi, ema_fast, ema_slow,
                            calc["take_profit"], calc["stop_loss"],
-                           calc["pos_size"], calc["hebel"],
+                           calc["pos_size"], 1.0,
                            f"RSI>{RSI_OVERBOUGHT}, EMA bearish")
+                threading.Thread(
+                    target=run_candle_confirmation,
+                    args=("SHORT", price),
+                    daemon=True
+                ).start()
 
         # ── RESET ────────────────────────────────────────────────
         elif RSI_OVERSOLD <= rsi <= RSI_OVERBOUGHT:

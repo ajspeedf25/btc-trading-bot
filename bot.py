@@ -908,6 +908,18 @@ def extract_result_via_claude(image_bytes: bytes) -> float | None:
     Gibt den Betrag als float zurück (negativ bei Verlust), oder None bei Fehler.
     """
     import base64
+
+    # Bildformat automatisch erkennen (JPEG oder PNG)
+    if image_bytes[:2] == b'\xff\xd8':
+        media_type = "image/jpeg"
+    elif image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        media_type = "image/png"
+    elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        media_type = "image/webp"
+    else:
+        media_type = "image/jpeg"   # Telegram-Fallback ist fast immer JPEG
+    logger.info(f"Claude Vision: Bildformat erkannt als {media_type} ({len(image_bytes)} Bytes)")
+
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     payload = {
@@ -920,7 +932,7 @@ def extract_result_via_claude(image_bytes: bytes) -> float | None:
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": "image/png",
+                        "media_type": media_type,
                         "data": b64
                     }
                 },
@@ -928,9 +940,8 @@ def extract_result_via_claude(image_bytes: bytes) -> float | None:
                     "type": "text",
                     "text": (
                         "This is a trading screenshot. "
-                        "Find the absolute profit or loss amount shown in € or $. "
+                        "Find the absolute profit or loss amount shown in EUR or USD (e.g. -3.42 USDT or +120 EUR). "
                         "Reply with ONLY a single number with sign, e.g. +120.50 or -34.20. "
-                        "If the currency is $ convert nothing, just return the number. "
                         "If you cannot find a clear profit/loss amount, reply with: UNKNOWN"
                     )
                 }
@@ -952,7 +963,11 @@ def extract_result_via_claude(image_bytes: bytes) -> float | None:
         json=payload,
         timeout=30
     )
-    resp.raise_for_status()
+
+    if not resp.ok:
+        logger.error(f"Claude API Fehler {resp.status_code}: {resp.text[:300]}")
+        resp.raise_for_status()
+
     raw = resp.json()["content"][0]["text"].strip()
     logger.info(f"Claude Vision Antwort: {raw!r}")
 

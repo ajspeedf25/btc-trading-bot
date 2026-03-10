@@ -1047,6 +1047,19 @@ def handle_photo(message) -> None:
         img_resp.raise_for_status()
         image_bytes = img_resp.content
 
+        # Bild verkleinern falls zu gross (Anthropic-Limit: 5MB / 8000px)
+        try:
+            from PIL import Image
+            import io as _io
+            _img = Image.open(_io.BytesIO(image_bytes))
+            _img.thumbnail((1600, 1600), Image.LANCZOS)
+            _buf = _io.BytesIO()
+            _img.convert('RGB').save(_buf, format='JPEG', quality=85)
+            image_bytes = _buf.getvalue()
+            logger.info(f'Bild skaliert: {_img.size}, {len(image_bytes)} Bytes')
+        except Exception as _e:
+            logger.warning(f'Bild-Skalierung fehlgeschlagen, sende Original: {_e}')
+
         # ── Screenshot ins Sheet eintragen ───────────────────────
         sheet_status = log_screenshot_to_sheet(photo_url)
 

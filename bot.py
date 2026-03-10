@@ -1112,7 +1112,24 @@ class BTCSignalBot:
         ensure_header()
         threading.Thread(target=run_schedule, daemon=True).start()
         # Polling-Thread für eingehende Telegram-Nachrichten (z.B. Foto-Uploads)
-        threading.Thread(target=tbot.infinity_polling, daemon=True).start()
+        # Mit 409-Schutz: bei Konflikt (andere Instanz aktiv) 30s warten und neu starten
+        def _polling_with_retry():
+            while True:
+                try:
+                    tbot.infinity_polling(timeout=20, long_polling_timeout=15)
+                except Exception as e:
+                    err = str(e)
+                    if "409" in err or "Conflict" in err:
+                        logger.warning(
+                            "Telegram 409 Conflict: Andere Bot-Instanz noch aktiv. "
+                            "Warte 30s und starte Polling neu..."
+                        )
+                        time.sleep(30)
+                    else:
+                        logger.error(f"Polling-Fehler: {e} – Neustart in 10s")
+                        time.sleep(10)
+
+        threading.Thread(target=_polling_with_retry, daemon=True).start()
 
     # ── Cooldown-Prüfung ──────────────────────────────────────────────────────
     def _cooldown_ok(self) -> bool:

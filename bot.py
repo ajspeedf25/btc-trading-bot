@@ -48,6 +48,7 @@ CHECK_INTERVAL    = 60       # Sekunden
 SIGNAL_COOLDOWN   = 30       # Minuten Mindestabstand zwischen Signalen
 
 BINANCE_BASE_URL  = "https://api.binance.com"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Manuell gesetzte Support/Widerstand-Levels (per /level Telegram-Command)
 manual_levels: dict = {"support": [], "resistance": []}
@@ -937,9 +938,17 @@ def extract_result_via_claude(image_bytes: bytes) -> float | None:
         }]
     }
 
+    if not ANTHROPIC_API_KEY:
+        logger.error("ANTHROPIC_API_KEY fehlt in den Umgebungsvariablen!")
+        return None
+
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
         json=payload,
         timeout=30
     )

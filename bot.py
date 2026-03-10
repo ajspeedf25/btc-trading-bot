@@ -103,7 +103,8 @@ def get_sheet():
 
 SHEET_HEADER = ["Timestamp", "Signal", "Symbol", "Preis (USD)", "RSI",
                 "EMA20", "EMA50", "Stop-Loss", "Take-Profit",
-                "Positionsgröße (€)", "Hebel", "Hinweis", "Screenshot"]
+                "Positionsgröße (€)", "Hebel", "Ergebnis (€)",
+                "Neuer Kontostand (€)", "Hinweis", "Signal-Nachricht", "Screenshot"]
 
 def ensure_header() -> None:
     try:
@@ -113,15 +114,19 @@ def ensure_header() -> None:
     except Exception as e:
         logger.error(f"Header-Fehler: {e}")
 
-def log_signal(signal: str, price: float, rsi: float, ema_fast: float,
-               ema_slow: float, stop: float, tp: float,
-               pos_size: float, hebel: float, note: str = "") -> None:
+def log_trade(signal: str, price: float, rsi: float, ema_fast: float,
+              ema_slow: float, stop: float, tp: float,
+              pos_size: float, hebel: float,
+              signal_text: str = "", note: str = "") -> None:
+    """Trägt einen tatsächlich eingegangenen Trade ins Sheet ein."""
     try:
         sheet = get_sheet()
         ts    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Ergebnis & neuer Kontostand werden erst beim /close-Command befüllt
         sheet.append_row([ts, signal, SYMBOL, price, rsi, round(ema_fast, 2),
-                          round(ema_slow, 2), stop, tp, pos_size, hebel, note])
-        logger.info(f"Sheet ✓ {signal}")
+                          round(ema_slow, 2), stop, tp, pos_size, hebel,
+                          "", "", note, signal_text, ""])
+        logger.info(f"Trade eingetragen ✓ {signal}")
     except Exception as e:
         logger.error(f"Sheet-Fehler: {e}")
 
@@ -824,25 +829,215 @@ def handle_level_command(message) -> None:
             "❌ Unbekannter Befehl. Nutze: support, resistance, clear, show")
 
 
+@tbot.message_handler(commands=["trade"])
+def handle_trade_command(message) -> None:
+    """
+    /trade  → bestätigt dass der letzte Signal-Trade tatsächlich eingegangen wurde.
+    Trägt ihn ins Google Sheet ein. Bis dahin bleibt der Trade im Puffer.
+    """
+    bot_instance = _get_bot_instance()
+    if bot_instance is None or bot_instance.pending_trade is None:
+        tbot.reply_to(message,
+            "⚠️ Kein offener Trade im Puffer. "
+            "Warte auf ein Signal bevor du /trade nutzt.")
+        return
+
+    t = bot_instance.pending_trade
+    log_trade(
+        t["signal"], t["price"], t["rsi"], t["ema_fast"], t["ema_slow"],
+        t["stop"], t["tp"], t["pos_size"], t["hebel"],
+        signal_text=bot_instance.last_signal_msg,
+        note=t["note"]
+    )
+    bot_instance.pending_trade = None   # Puffer leeren
+
+    tbot.reply_to(message,
+        f"✅ <b>Trade eingetragen</b>\n"
+        f"Signal: <b>{t['signal']}</b> @ ${t['price']:,.2f}\n"
+        f"Stop-Loss: ${t['stop']:,.2f} | Take-Profit: ${t['tp']:,.2f}\n\n"
+        f"Trade abgeschlossen? → /close +120 (Gewinn) oder /close -50 (Verlust)",
+        parse_mode="HTML")
+
+
+@tbot.message_handler(commands=["close"])
+def handle_close_command(message) -> None:
+    """
+    /close +120   → Trade mit +120 € Gewinn abschließen
+    /close -50    → Trade mit -50 € Verlust abschließen
+
+    Trägt Ergebnis in die letzte offene Trade-Zeile ein und
+    aktualisiert den globalen ACCOUNT_BALANCE.
+    """
+    global ACCOUNT_BALANCE
+
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        tbot.reply_to(message,
+            "ℹ️ Verwendung: /close +120  oder  /close -50\n"
+            "(Ergebnis in € angeben, mit Vorzeichen)")
+        return
+
+    try:
+        ergebnis = float(parts[1].replace(",", "."))
+    except ValueError:
+        tbot.reply_to(message, "❌ Ungültiger Wert. Beispiel: /close +120 oder /close -50")
+        return
+
+    ok, reply = apply_close_to_sheet(ergebnis)
+    tbot.reply_to(message, reply, parse_mode="HTML")
+
+
+def extract_result_via_claude(image_bytes: bytes) -> float | None:
+    """
+    Schickt das Screenshot-Bild an Claude Vision und extrahiert
+    den absoluten Gewinn/Verlust-Betrag in € oder $.
+    Gibt den Betrag als float zurück (negativ bei Verlust), oder None bei Fehler.
+    """
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    payload = {
+        "model": "claude-opus-4-5",
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": b64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "This is a trading screenshot. "
+                        "Find the absolute profit or loss amount shown in € or $. "
+                        "Reply with ONLY a single number with sign, e.g. +120.50 or -34.20. "
+                        "If the currency is $ convert nothing, just return the number. "
+                        "If you cannot find a clear profit/loss amount, reply with: UNKNOWN"
+                    )
+                }
+            ]
+        }]
+    }
+
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=30
+    )
+    resp.raise_for_status()
+    raw = resp.json()["content"][0]["text"].strip()
+    logger.info(f"Claude Vision Antwort: {raw!r}")
+
+    if raw.upper() == "UNKNOWN":
+        return None
+
+    # Zahl parsen: +120.50 / -34,20 / 120.50
+    import re
+    match = re.search(r"[+-]?\d+[.,]?\d*", raw)
+    if not match:
+        return None
+    return float(match.group().replace(",", "."))
+
+
+def apply_close_to_sheet(ergebnis: float) -> tuple[bool, str]:
+    """
+    Gemeinsame Logik für /close und automatischen Screenshot-Close.
+    Trägt Ergebnis ins Sheet ein, passt ACCOUNT_BALANCE an.
+    Gibt (success, antwort_text) zurück.
+    """
+    global ACCOUNT_BALANCE
+    try:
+        sheet   = get_sheet()
+        rows    = sheet.get_all_values()
+        header  = rows[0]
+        sig_col = header.index("Signal")
+        res_col = header.index("Ergebnis (€)") + 1
+        bal_col = header.index("Neuer Kontostand (€)") + 1
+
+        target_row = None
+        for i in range(len(rows) - 1, 0, -1):
+            row     = rows[i]
+            sig_val = row[sig_col]     if len(row) > sig_col  else ""
+            res_val = row[res_col - 1] if len(row) >= res_col else ""
+            if sig_val in ("LONG", "SHORT") and not str(res_val).strip():
+                target_row = i + 1
+                break
+
+        if target_row is None:
+            return False, "⚠️ Keine offene Trade-Zeile ohne Ergebnis gefunden."
+
+        ACCOUNT_BALANCE = round(ACCOUNT_BALANCE + ergebnis, 2)
+        sheet.update_cell(target_row, res_col, ergebnis)
+        sheet.update_cell(target_row, bal_col, ACCOUNT_BALANCE)
+
+        prefix = "🟢 Gewinn" if ergebnis >= 0 else "🔴 Verlust"
+        sign   = "+" if ergebnis >= 0 else ""
+        reply  = (
+            f"{prefix}: <b>{sign}{ergebnis} €</b>\n"
+            f"💼 Neuer Kontostand: <b>{ACCOUNT_BALANCE} €</b>\n"
+            f"📦 Nächste Margin (10%): "
+            f"<b>{round(ACCOUNT_BALANCE * TRADE_ALLOCATION, 2)} €</b>"
+        )
+        logger.info(f"Trade geschlossen: {sign}{ergebnis} € | Kontostand: {ACCOUNT_BALANCE} €")
+        return True, reply
+
+    except Exception as e:
+        logger.error(f"apply_close Fehler: {e}")
+        return False, f"❌ Fehler: {e}"
+
+
 @tbot.message_handler(content_types=["photo"])
 def handle_photo(message) -> None:
     """
-    Wird ausgelöst, wenn du ein Foto an den Bot schickst.
-    Nimmt die höchste Auflösung, holt die Download-URL
-    und trägt sie in die letzte offene Sheet-Zeile ein.
+    Screenshot-Upload per Telegram:
+    1. Foto-URL ins Sheet eintragen
+    2. Bild per Claude Vision auswerten → Gewinn/Verlust extrahieren
+    3. Kontostand automatisch anpassen (kein /close nötig)
     """
+    global ACCOUNT_BALANCE
     try:
-        # Höchste Auflösung = letztes Element in photo-Array
         file_id   = message.photo[-1].file_id
         photo_url = get_photo_url(file_id)
-        caption   = message.caption or ""
 
-        status = log_screenshot_to_sheet(photo_url)
-        reply  = f"📸 <b>Screenshot empfangen</b>\n{status}"
-        if caption:
-            reply += f"\n📝 Caption: {caption}"
+        # Bild-Bytes für Claude Vision laden
+        img_resp    = requests.get(photo_url, timeout=15)
+        img_resp.raise_for_status()
+        image_bytes = img_resp.content
+
+        # ── Screenshot ins Sheet eintragen ───────────────────────
+        sheet_status = log_screenshot_to_sheet(photo_url)
+
+        # ── Claude Vision: Ergebnis auslesen ─────────────────────
+        tbot.reply_to(message,
+            "🔍 Analysiere Screenshot...", parse_mode="HTML")
+
+        ergebnis = extract_result_via_claude(image_bytes)
+
+        if ergebnis is None:
+            tbot.reply_to(message,
+                f"📸 <b>Screenshot gespeichert</b>\n{sheet_status}\n\n"
+                f"⚠️ Kein eindeutiger Betrag erkannt.\n"
+                f"Bitte manuell abschließen: /close +120 oder /close -50",
+                parse_mode="HTML")
+            return
+
+        # ── Kontostand anpassen ───────────────────────────────────
+        ok, close_reply = apply_close_to_sheet(ergebnis)
+
+        reply = (
+            f"📸 <b>Screenshot gespeichert</b>\n{sheet_status}\n\n"
+            f"🤖 <b>Claude Vision erkannt:</b> "
+            f"{'<b>+' if ergebnis >= 0 else '<b>'}{ergebnis} €</b>\n\n"
+            f"{close_reply}"
+        )
         tbot.reply_to(message, reply, parse_mode="HTML")
-        logger.info(f"Foto verarbeitet: {photo_url}")
+
     except Exception as e:
         logger.error(f"Foto-Handler Fehler: {e}")
         tbot.reply_to(message, f"❌ Fehler beim Verarbeiten: {e}")
@@ -862,11 +1057,21 @@ def run_schedule() -> None:
 # SIGNAL BOT
 # ─────────────────────────────────────────────
 
+_bot_instance_ref = None  # Globale Referenz für Telegram-Handler
+
+def _get_bot_instance():
+    return _bot_instance_ref
+
+
 class BTCSignalBot:
     def __init__(self):
         self.last_signal      = None
         self.prev_ema_cross   = None                # vorheriger EMA-Kreuzungsstatus
         self.last_signal_time = None                # Zeitstempel des letzten Signals
+        self.last_signal_msg  = ""                  # letzter Signal-Text für Logbuch
+        self.pending_trade    = None                # offener Trade-Datensatz bis /close
+        global _bot_instance_ref
+        _bot_instance_ref = self
         logger.info("BTC Signal Bot gestartet.")
         send_telegram(
             f"🤖 <b>BTC Signal Bot gestartet</b>\n\n"
@@ -943,12 +1148,16 @@ class BTCSignalBot:
                 sl_warning = check_sl_near_level(calc["stop_loss"], levels)
                 msg = build_long_message(price, rsi, ema_fast, ema_slow,
                                          calc, minutes, levels, sl_warning)
-                send_telegram(msg)
-                log_signal("LONG", price, rsi, ema_fast, ema_slow,
-                           calc["stop_loss"], calc["take_profit"],
-                           calc["pos_size"], calc["hebel"],
-                           f"RSI<{RSI_OVERSOLD}, EMA bullish | "
-                           f"Sup:{levels['support']} Res:{levels['resistance']}")
+                self.last_signal_msg = msg
+                self.pending_trade = {
+                    "signal": "LONG", "price": price, "rsi": rsi,
+                    "ema_fast": ema_fast, "ema_slow": ema_slow,
+                    "stop": calc["stop_loss"], "tp": calc["take_profit"],
+                    "pos_size": calc["pos_size"], "hebel": calc["hebel"],
+                    "note": f"RSI<{RSI_OVERSOLD}, EMA bullish | "
+                            f"Sup:{levels['support']} Res:{levels['resistance']}"
+                }
+                send_telegram(msg + "\n\n💬 Trade eingegangen? → /trade bestätigen")
                 threading.Thread(
                     target=run_candle_confirmation,
                     args=("LONG", price),
@@ -963,12 +1172,16 @@ class BTCSignalBot:
                 sl_warning = check_sl_near_level(calc["take_profit"], levels)
                 msg = build_short_message(price, rsi, ema_fast, ema_slow,
                                           calc, minutes, levels, sl_warning)
-                send_telegram(msg)
-                log_signal("SHORT", price, rsi, ema_fast, ema_slow,
-                           calc["take_profit"], calc["stop_loss"],
-                           calc["pos_size"], calc["hebel"],
-                           f"RSI>{RSI_OVERBOUGHT}, EMA bearish | "
-                           f"Sup:{levels['support']} Res:{levels['resistance']}")
+                self.last_signal_msg = msg
+                self.pending_trade = {
+                    "signal": "SHORT", "price": price, "rsi": rsi,
+                    "ema_fast": ema_fast, "ema_slow": ema_slow,
+                    "stop": calc["take_profit"], "tp": calc["stop_loss"],
+                    "pos_size": calc["pos_size"], "hebel": calc["hebel"],
+                    "note": f"RSI>{RSI_OVERBOUGHT}, EMA bearish | "
+                            f"Sup:{levels['support']} Res:{levels['resistance']}"
+                }
+                send_telegram(msg + "\n\n💬 Trade eingegangen? → /trade bestätigen")
                 threading.Thread(
                     target=run_candle_confirmation,
                     args=("SHORT", price),

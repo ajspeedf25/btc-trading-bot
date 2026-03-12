@@ -703,7 +703,9 @@ def run_candle_confirmation(direction: str, entry_price: float) -> None:
         if not ok:
             return  # Abbruch bei nicht bestätigter Kerze
 
-        after_time  = candle["open_time"]
+        # after_time auf Kerzen-Ende setzen (open_time + 5 Min),
+        # damit _wait_for_next_closed_candle nicht dieselbe Kerze nochmal liefert
+        after_time  = candle["open_time"] + datetime.timedelta(minutes=5)
         prev_candle = candle
 
 
